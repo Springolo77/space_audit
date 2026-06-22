@@ -530,38 +530,92 @@ se `/mnt` è tra le esclusioni di default.
 
 ## Script di monitoraggio
 
-`space_audit_monitor.sh` (v3.0) è un diagnostico **in sola lettura** da lanciare
-in un'altra shell mentre l'audit gira. È **consapevole delle fasi** e mostra ciò
-che è rilevante per ciascuna:
+`space_audit_monitor.sh` (v3.1) è un diagnostico **in sola lettura** da lanciare
+in un'**altra shell** mentre l'audit gira, per capire a che punto è e cosa sta
+facendo. Legge solo `/proc` e `ps`: **non scrive nulla** e non tocca né lo
+strumento né il filesystem scansionato.
 
-- **SCAN** — elenca i worker `find` attivi (anche in parallelo), per ognuno il
-  file `.part.N` che sta scrivendo con la dimensione corrente, il totale dei
-  temporanei e il numero di worker. (In scansione la % non è disponibile: il
-  totale non è noto finché `find` non finisce.)
-- **AGGREGAZIONE** — PID e risorse dell'`awk` aggregatore e l'**avanzamento %**
-  calcolato dalla posizione di lettura del dataset (`/proc/<pid>/fdinfo`) sulla
-  dimensione del `.tsv.gz`.
-- **VISTE** — gli ordinamenti finali (top-N e sottoinsieme > 10 anni).
-
-Inoltre: risorse (`ps`) di tutti i processi coinvolti, statistiche I/O e un
-campione `strace -c` di 1s sul processo più attivo.
-
-I processi vengono riconosciuti per firma di cmdline **e** filtrati per
-discendenza dal processo principale dell'audit, così non vengono confusi con
-`find`/`awk`/`sort` estranei in esecuzione sul sistema.
-
-Uso:
+### Avvio
 
 ```bash
-./space_audit_monitor.sh        # uno snapshot
-./space_audit_monitor.sh 2      # aggiorna ogni 2 secondi (Ctrl-C per uscire)
+./space_audit_monitor.sh        # uno snapshot e termina
+./space_audit_monitor.sh 2      # si aggiorna ogni 2 secondi (Ctrl-C per uscire)
 ```
 
-Note: `strace` e `/proc/<pid>/io` richiedono lo **stesso utente** dell'audit (o
-root) e un `ptrace_scope` permissivo; in mancanza, lo script degrada con
-messaggi espliciti senza fallire. Il riconoscimento del processo principale usa
-il nome `space_audit.sh`; se rinominato, le fasi restano comunque rilevate (per
-firma), ma senza il filtro per discendenza.
+Si lancia in qualsiasi momento, senza coordinarsi con l'audit: trova da solo il
+processo `space_audit.sh` in corso. Conviene eseguirlo **come lo stesso utente**
+dell'audit (o root): alcune letture (`/proc/<pid>/io`, strace) altrimenti non
+sono accessibili e vengono semplicemente saltate con un messaggio.
+
+### Variabili d'ambiente
+
+| Variabile | Default | Effetto |
+| --- | --- | --- |
+| `MON_STRACE` | `0` | `1` = aggiunge un campione `strace -c` di 1s sul processo più attivo. **È l'unica parte intrusiva**: l'attach `ptrace` mette in pausa il target a ogni syscall, quindi su una scansione che ne fa milioni al secondo la **rallenta** per quel secondo. Tenerlo spento salvo necessità. |
+| `MON_CPU_DT` | `0.3` | Ampiezza (secondi) della finestra per il calcolo della **CPU istantanea**. Più larga = misura più stabile ma snapshot più lento. |
+
+### Consapevolezza delle fasi
+
+Riconosce i processi figli dell'audit per **firma di cmdline** (`find … %T@`,
+`awk … maxk=`, `sort … -T`) e li filtra per **discendenza** dal processo
+principale, così non li confonde con `find`/`awk`/`sort` estranei in esecuzione
+sul sistema. La fase mostrata e i dettagli relativi:
+
+- **SCAN** — elenca i worker `find` attivi (anche in parallelo); per ognuno la
+  CPU istantanea e, in modalità parallela, il file `.part.*` che sta scrivendo
+  con la dimensione corrente (più il totale dei temporanei). Mostra anche quanto
+  è cresciuto finora il dataset `.tsv.gz`. La **% non è disponibile** in questa
+  fase: il totale dei file non è noto finché `find` non termina.
+- **AGGREGAZIONE** — PID, CPU e RSS dell'`awk` aggregatore, con l'**avanzamento %**
+  ricavato dalla posizione di lettura del dataset (`/proc/<pid>/fdinfo`) rapportata
+  alla dimensione del `.tsv.gz`.
+- **SCAN+AGGREGAZIONE (streaming)** — in modalità `STREAM=1` le due fasi sono
+  **fuse** (il `find` alimenta direttamente l'`awk`, senza dataset): il monitor lo
+  rileva e segnala che l'avanzamento % non è disponibile (non c'è dataset da cui
+  leggerlo).
+- **VISTE** — gli ordinamenti finali (`sort` dei top-N e del sottoinsieme > 10
+  anni).
+
+Quando non rileva nessuna fase attiva, lo stato è
+`(inattivo / render / completato)`: l'audit non è in corso, oppure è nella breve
+fase finale di scrittura di report/HTML/CSV/JSON (che non ha processi
+caratteristici da intercettare).
+
+### Lettura dell'output
+
+- **`Audit PID` / `Comando`** — processo principale e riga di comando con cui è
+  stato lanciato (utile per ricontrollare ROOT, OUTDIR ed eventuali variabili).
+- **CPU%** — è **istantanea** (delta di `utime+stime` da `/proc/<pid>/stat` sulla
+  finestra `MON_CPU_DT`), non la media di vita di `ps`. Un `?` indica un processo
+  troppo effimero per essere campionato nella finestra (tipico solo su scansioni
+  brevissime; su milioni di file i processi sono longevi e mostrano valori pieni).
+- **`[RISORSE]`** — tabella compatta con CPU istantanea, RSS ed `elapsed` di tutti
+  i processi coinvolti.
+- **`[I/O]`** — contatori da `/proc/<pid>/io` del processo più attivo (byte
+  letti/scritti): utile per distinguere se è I/O-bound (tipico in SCAN su SMB) o
+  CPU-bound (tipico in AGGREGAZIONE).
+- **`[STRACE]`** — di default segnala solo che è disattivato; con `MON_STRACE=1`
+  mostra il profilo delle syscall dell'ultimo secondo.
+
+### Requisiti e degradazione
+
+Richiede `bash`, `awk`, `ps`, `stat`, `readlink` e l'accesso a `/proc` (standard
+su Linux). `strace` e `/proc/<pid>/io` richiedono lo **stesso utente** dell'audit
+(o root) e un `ptrace_scope` permissivo; in mancanza, il monitor degrada con
+messaggi espliciti **senza fallire**. Il riconoscimento del processo principale
+usa il nome `space_audit.sh`: se lo script è stato rinominato, le fasi restano
+comunque rilevate per firma, ma senza il filtro per discendenza (potrebbero
+comparire `find`/`awk`/`sort` estranei).
+
+### Esempio d'uso tipico
+
+```bash
+# Terminale 1: avvia l'audit di un grande share
+./space_audit.sh /mnt/Antiriciclaggio_WS
+
+# Terminale 2: osserva l'andamento ogni 3 secondi
+./space_audit_monitor.sh 3
+```
 
 ## Conformità e retention
 
