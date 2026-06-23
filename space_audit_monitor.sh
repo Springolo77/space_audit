@@ -160,6 +160,10 @@ snapshot(){
   # STREAM: find attivo che alimenta direttamente l'awk aggregatore (nessun dataset)
   local stream=0
   [[ -n "$finds" && -n "$aggs" ]] && stream=1
+  # ROLLUP: awk vivo, dataset gia' letto (nessun decompressore) e nessun find ->
+  # fase END (consolidamento gerarchico); distinta dalla lettura del dataset.
+  local rollup=0
+  [[ -n "$aggs" && "$stream" -ne 1 && -z "$decs" && -z "$finds" ]] && rollup=1
 
   # --- CPU istantanea per tutti i pid coinvolti (un solo campione) --------
   local allpids
@@ -171,6 +175,7 @@ snapshot(){
   local phase="(inattivo / render / completato)"
   [[ -n "$sorts" ]] && phase="VISTE / ordinamenti finali"
   [[ -n "$aggs"  ]] && phase="AGGREGAZIONE (single-pass)"
+  [[ "$rollup" -eq 1 ]] && phase="AGGREGAZIONE (rollup / finalizzazione)"
   [[ -n "$finds" ]] && phase="SCAN (find)"
   [[ "$stream" -eq 1 ]] && phase="SCAN+AGGREGAZIONE (streaming)"
   echo "---------------------------------------------------------------"
@@ -214,7 +219,11 @@ snapshot(){
   if [[ -n "$aggs" ]]; then
     local apid r fd gz pos tot done=0
     apid=$(printf '%s\n' $aggs | head -n1)
-    echo "[AGGREGAZIONE] awk PID $apid   cpu $(cpu_of "$apid")%   rss $(human "$(rss_of "$apid")")"
+    if [[ "$rollup" -eq 1 ]]; then
+      echo "[AGGREGAZIONE - rollup/finalizzazione] awk PID $apid   cpu $(cpu_of "$apid")%   rss $(human "$(rss_of "$apid")")"
+    else
+      echo "[AGGREGAZIONE] awk PID $apid   cpu $(cpu_of "$apid")%   rss $(human "$(rss_of "$apid")")"
+    fi
     if [[ "$stream" -eq 1 ]]; then
       echo "   STREAM: aggregazione in corso sullo stream del find; avanzamento % non disponibile"
     else
@@ -224,12 +233,18 @@ snapshot(){
           pos=$(awk '/^pos:/{print $2}' "/proc/$pid/fdinfo/$fd" 2>/dev/null || echo 0)
           tot=$(stat -c %s "$gz" 2>/dev/null || echo 0)
           if [[ "${tot:-0}" -gt 0 ]]; then
-            awk -v p="${pos:-0}" -v t="$tot" 'BEGIN{printf "   avanzamento: %.1f%% (%d/%d byte compressi del dataset)\n",(p>t?100:p*100/t),p,t}'
+            awk -v p="${pos:-0}" -v t="$tot" 'BEGIN{printf "   lettura dataset: %.1f%% (%d/%d byte compressi)\n",(p>t?100:p*100/t),p,t}'
             done=1
           fi
         fi
       done
-      [[ "$done" -eq 0 ]] && echo "   avanzamento non disponibile (decompressore non visibile o fdinfo non leggibile)"
+      if [[ "$rollup" -eq 1 ]]; then
+        echo "   lettura dataset completata: consolidamento gerarchico (rollup) in corso."
+        echo "   non e' un blocco: con CPU ~100% sta calcolando. Il completamento si vede"
+        echo "   in [I/O] quando 'wchar' inizia a salire (scrittura delle mappe directory)."
+      elif [[ "$done" -eq 0 ]]; then
+        echo "   avanzamento non disponibile (decompressore non visibile o fdinfo non leggibile)"
+      fi
     fi
     echo "   nota: top-N tenuti in memoria; nessun sort globale sul dataset"
     echo
