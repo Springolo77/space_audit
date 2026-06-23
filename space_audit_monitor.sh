@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 #
-# space_audit_monitor.sh - v3.1 (read-only)
+# space_audit_monitor.sh - v3.2 (read-only)
 # Diagnostica una scansione space_audit.sh in corso, consapevole delle fasi:
-#   SCAN (find, anche parallelo) -> AGGREGAZIONE (awk maxk=) -> VISTE (sort).
+#   SCAN (find) -> AGGREGAZIONE/lettura dataset (awk maxk=) ->
+#   ROLLUP directory (sort esterno + awk rstart=) -> VISTE (sort finali).
 # Riconosce anche la modalita' STREAM (scan+aggregazione fusi, nessun dataset).
 #
 # NON modifica nulla: legge solo /proc e ps. La CPU mostrata e' ISTANTANEA
@@ -126,7 +127,7 @@ fd_matching(){
 snapshot(){
   prime_proc
   echo "==============================================================="
-  echo " SPACE_AUDIT MONITOR v3.1 (read-only)   $(date '+%H:%M:%S')"
+  echo " SPACE_AUDIT MONITOR v3.2 (read-only)   $(date '+%H:%M:%S')"
   echo "==============================================================="
 
   # --- processo principale (per nome di default dello script) -------------
@@ -147,10 +148,12 @@ snapshot(){
   fi
 
   # --- rilevamento processi per fase (firma cmdline + discendenza) --------
-  local finds aggs sorts decs cm
-  finds=$(match_pids '%T@'   | filter_desc)   # worker find (-printf ... %T@ ...)
-  aggs=$(match_pids 'maxk='  | filter_desc)   # awk aggregatore single-pass
-  sorts=$(match_pids ' -T '  | filter_desc)   # sort dello strumento (-T WORK_TMP)
+  local finds aggs sorts decs rollup_pids draw_sort cm
+  finds=$(match_pids '%T@'      | filter_desc)   # worker find (-printf ... %T@ ...)
+  aggs=$(match_pids 'maxk='     | filter_desc)   # awk aggregatore per-file (lettura dataset)
+  rollup_pids=$(match_pids 'rstart=' | filter_desc)  # awk a stack del rollup esterno
+  draw_sort=$(match_pids '.draw'     | filter_desc)  # sort -k2 che ordina T_DRAW (rollup)
+  sorts=$(match_pids ' -T '     | filter_desc)   # sort GNU (-T): viste finali e/o sort di rollup
   decs=""
   for pid in $(match_pids '.tsv.gz' | filter_desc); do
     cm="${COMM[$pid]:-}"
@@ -160,22 +163,21 @@ snapshot(){
   # STREAM: find attivo che alimenta direttamente l'awk aggregatore (nessun dataset)
   local stream=0
   [[ -n "$finds" && -n "$aggs" ]] && stream=1
-  # ROLLUP: awk vivo, dataset gia' letto (nessun decompressore) e nessun find ->
-  # fase END (consolidamento gerarchico); distinta dalla lettura del dataset.
+  # ROLLUP esterno: awk a stack (rstart=) e/o il sort che ordina il file 'draw'.
   local rollup=0
-  [[ -n "$aggs" && "$stream" -ne 1 && -z "$decs" && -z "$finds" ]] && rollup=1
+  [[ -n "$rollup_pids" || -n "$draw_sort" ]] && rollup=1
 
   # --- CPU istantanea per tutti i pid coinvolti (un solo campione) --------
   local allpids
-  allpids=$(echo "$main_pid $finds $aggs $decs $sorts" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u)
+  allpids=$(echo "$main_pid $finds $aggs $rollup_pids $draw_sort $decs $sorts" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u)
   # shellcheck disable=SC2086
   cpu_sample $allpids
 
   # --- fase corrente ------------------------------------------------------
   local phase="(inattivo / render / completato)"
   [[ -n "$sorts" ]] && phase="VISTE / ordinamenti finali"
-  [[ -n "$aggs"  ]] && phase="AGGREGAZIONE (single-pass)"
-  [[ "$rollup" -eq 1 ]] && phase="AGGREGAZIONE (rollup / finalizzazione)"
+  [[ -n "$aggs"  ]] && phase="AGGREGAZIONE (lettura dataset)"
+  [[ "$rollup" -eq 1 ]] && phase="AGGREGAZIONE (rollup directory, sort esterno)"
   [[ -n "$finds" ]] && phase="SCAN (find)"
   [[ "$stream" -eq 1 ]] && phase="SCAN+AGGREGAZIONE (streaming)"
   echo "---------------------------------------------------------------"
@@ -215,15 +217,11 @@ snapshot(){
     echo
   fi
 
-  # --- blocco AGGREGAZIONE ------------------------------------------------
+  # --- blocco AGGREGAZIONE (lettura dataset, passata per-file) ------------
   if [[ -n "$aggs" ]]; then
     local apid r fd gz pos tot done=0
     apid=$(printf '%s\n' $aggs | head -n1)
-    if [[ "$rollup" -eq 1 ]]; then
-      echo "[AGGREGAZIONE - rollup/finalizzazione] awk PID $apid   cpu $(cpu_of "$apid")%   rss $(human "$(rss_of "$apid")")"
-    else
-      echo "[AGGREGAZIONE] awk PID $apid   cpu $(cpu_of "$apid")%   rss $(human "$(rss_of "$apid")")"
-    fi
+    echo "[AGGREGAZIONE] awk PID $apid (lettura dataset)  cpu $(cpu_of "$apid")%  rss $(human "$(rss_of "$apid")")"
     if [[ "$stream" -eq 1 ]]; then
       echo "   STREAM: aggregazione in corso sullo stream del find; avanzamento % non disponibile"
     else
@@ -238,20 +236,29 @@ snapshot(){
           fi
         fi
       done
-      if [[ "$rollup" -eq 1 ]]; then
-        echo "   lettura dataset completata: consolidamento gerarchico (rollup) in corso."
-        echo "   non e' un blocco: con CPU ~100% sta calcolando. Il completamento si vede"
-        echo "   in [I/O] quando 'wchar' inizia a salire (scrittura delle mappe directory)."
-      elif [[ "$done" -eq 0 ]]; then
-        echo "   avanzamento non disponibile (decompressore non visibile o fdinfo non leggibile)"
-      fi
+      [[ "$done" -eq 0 ]] && echo "   avanzamento non disponibile (decompressore non visibile o fdinfo non leggibile)"
     fi
-    echo "   nota: top-N tenuti in memoria; nessun sort globale sul dataset"
+    echo "   nota: contributi per-directory scritti su file 'draw'; il rollup avviene a valle (sort esterno)"
     echo
   fi
 
-  # --- blocco VISTE -------------------------------------------------------
-  if [[ -n "$sorts" && -z "$finds" && -z "$aggs" ]]; then
+  # --- blocco ROLLUP directory (sort esterno) -----------------------------
+  if [[ "$rollup" -eq 1 ]]; then
+    local rp sp
+    echo "[ROLLUP directory] consolidamento gerarchico via sort esterno (RAM costante, nessun cap)"
+    for sp in $draw_sort; do
+      printf "   sort -k2   pid %-7s cpu %5s%%  rss %s\n" "$sp" "$(cpu_of "$sp")" "$(human "$(rss_of "$sp")")"
+    done
+    for rp in $rollup_pids; do
+      printf "   awk stack  pid %-7s cpu %5s%%  rss %s\n" "$rp" "$(cpu_of "$rp")" "$(human "$(rss_of "$rp")")"
+    done
+    echo "   avanzamento: lo script stampa 'rollup... N directory' su stderr."
+    echo "   non e' un blocco: e' lavoro CPU+disco a RAM costante (non cresce come prima)."
+    echo
+  fi
+
+  # --- blocco VISTE (solo se NON e' la fase di rollup) --------------------
+  if [[ -n "$sorts" && -z "$finds" && -z "$aggs" && "$rollup" -ne 1 ]]; then
     echo "[VISTE] sort attivi (top-N e sottoinsieme >10 anni):"
     for pid in $sorts; do
       printf "   pid %-7s cpu %5s%%  %s\n" "$pid" "$(cpu_of "$pid")" "${COMM[$pid]:-sort}"
@@ -272,8 +279,11 @@ snapshot(){
   fi
 
   # --- I/O del processo piu' attivo (stesso utente dell'audit o root) -----
+  # priorita': aggregatore (lettura) -> awk rollup -> sort rollup -> find
   local busy=""
   busy=$(printf '%s\n' $aggs | head -n1)
+  [[ -z "$busy" ]] && busy=$(printf '%s\n' $rollup_pids | head -n1)
+  [[ -z "$busy" ]] && busy=$(printf '%s\n' $draw_sort | head -n1)
   [[ -z "$busy" ]] && busy=$(printf '%s\n' $finds | head -n1)
   if [[ -n "$busy" ]]; then
     echo "[I/O] pid $busy"
