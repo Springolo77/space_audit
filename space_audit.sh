@@ -35,6 +35,8 @@ STRICT_SCAN="${STRICT_SCAN:-0}"          # 1 = abortisce se errori find > FIND_E
 FIND_ERR_MAX="${FIND_ERR_MAX:-10000}"    # soglia errori find tollerati (solo con STRICT_SCAN)
 FAST="${FAST:-0}"                        # 1 = salta Top Files / Cleanup / Over-10y (meno CPU per-file)
 STREAM="${STREAM:-0}"                    # 1 = find->awk diretto, nessun dataset .tsv.gz (no artefatto, no %)
+FROM_DATASET="${FROM_DATASET:-}"         # path a un .tsv.gz esistente: riaggrega SENZA scansionare
+AS_OF="${AS_OF:-}"                        # epoch o data per ancorare l'eta' (default: TS nel nome del dataset)
 MIN_FREE_MB="${MIN_FREE_MB:-512}"        # spazio minimo (MB) in WORK_TMP: sotto -> warning (abort se STRICT_SCAN)
 WARN=0                                    # diventa 1 se il run completa con warning (exit 2)
 
@@ -81,6 +83,23 @@ CSV10="${BASE}.over10y.csv"
 LOGFILE="${LOGDIR}/${HOST}_${ROOT_TAG}_${TS}.log"
 
 NOW="$(date +%s)"
+# Riferimento temporale per il calcolo dell'eta'. Di norma e' "adesso"; in
+# modalita' FROM_DATASET il dataset puo' essere stato prodotto tempo prima, quindi
+# si ancora al momento della scansione: AS_OF (epoch o data) se fornito, altrimenti
+# il timestamp YYYYMMDD_HHMMSS estratto dal nome del dataset; fallback a NOW.
+AGG_NOW="$NOW"
+if [[ -n "$FROM_DATASET" ]]; then
+    if [[ -n "$AS_OF" ]]; then
+        if [[ "$AS_OF" =~ ^[0-9]+$ ]]; then AGG_NOW="$AS_OF"
+        else AGG_NOW="$(date -d "$AS_OF" +%s 2>/dev/null || echo "$NOW")"; fi
+    else
+        _dts="$(printf '%s' "$FROM_DATASET" | grep -oE '[0-9]{8}_[0-9]{6}' | tail -1 || true)"
+        if [[ -n "$_dts" ]]; then
+            _d="${_dts%_*}"; _t="${_dts#*_}"
+            AGG_NOW="$(date -d "${_d:0:4}-${_d:4:2}-${_d:6:2} ${_t:0:2}:${_t:2:2}:${_t:4:2}" +%s 2>/dev/null || echo "$NOW")"
+        fi
+    fi
+fi
 # offset locale (secondi) per la data nel CSV (granularita giorno; DST corrente)
 TZOFF="$(date +%z | awk '{s=substr($0,1,1);h=substr($0,2,2)+0;m=substr($0,4,2)+0;v=h*3600+m*60;print (s=="-")?-v:v}')"
 [[ "$TZOFF" =~ ^-?[0-9]+$ ]] || TZOFF=0
@@ -150,6 +169,13 @@ SCANCNT="$(mktemp "${WORK_TMP}/.cnt.XXXXXX")"
 
 log "START host=$HOST root=$ROOT outdir=$OUTDIR"
 log "params TOPN=$TOPN OLD_DAYS=$OLD_DAYS YEARS_VIEW=$YEARS_VIEW AGG_DEPTH=$AGG_DEPTH CROSS_MOUNTS=$CROSS_MOUNTS MAX_DIR_KEYS=$MAX_DIR_KEYS WORK_TMP=$WORK_TMP SCAN_JOBS=$SCAN_JOBS FAST=$FAST STREAM=$STREAM STRICT_SCAN=$STRICT_SCAN"
+
+# FROM_DATASET: riaggrega un dataset esistente, senza scansionare. Incompatibile
+# con STREAM (che per definizione non produce un dataset).
+if [[ -n "$FROM_DATASET" ]]; then
+    STREAM=0
+    log "MODE: rigenerazione da dataset (FROM_DATASET=$FROM_DATASET, AGG_NOW=$AGG_NOW); nessuna scansione"
+fi
 
 # STREAM e' incompatibile con lo scan parallelo (richiederebbe merge via process-subst):
 # in streaming l'aggregazione avviene durante un singolo find -> forziamo seriale.
@@ -236,7 +262,21 @@ check_find_errors() {
     fi
 }
 
-if [[ "$STREAM" = "1" ]]; then
+if [[ -n "$FROM_DATASET" ]]; then
+    HAVE_DATASET=1
+    if [[ ! -f "$FROM_DATASET" ]]; then
+        log "ERROR: dataset non trovato: $FROM_DATASET"
+        echo "ERROR: dataset non trovato: $FROM_DATASET" >&2
+        exit 1
+    fi
+    DATA="$FROM_DATASET"     # riusa il dataset esistente come sorgente (NON e' un temp: non viene rimosso)
+    if [[ "$(run_lowprio "${DECOMP[@]}" "$DATA" 2>/dev/null | head -c1 | wc -c || true)" -eq 0 ]]; then
+        log "ERROR: dataset vuoto o illeggibile: $DATA"
+        echo "ERROR: dataset vuoto o illeggibile: $DATA" >&2
+        exit 1
+    fi
+    log "Rigenerazione da dataset: $DATA ($(du -h "$DATA" 2>/dev/null | cut -f1)); riferimento eta' = $(date -d "@$AGG_NOW" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "$AGG_NOW")"
+elif [[ "$STREAM" = "1" ]]; then
     HAVE_DATASET=0
     log "Scan+aggregazione in STREAMING (nessun dataset .tsv.gz intermedio; progress senza %)"
 else
@@ -342,7 +382,7 @@ TOTAL_SCANNED="$(cat "$SCANCNT" 2>/dev/null || echo 0)"
 [[ "$TOTAL_SCANNED" =~ ^[0-9]+$ ]] || TOTAL_SCANNED=0
 
 { if [[ "$STREAM" = "1" ]]; then scan_find_serial; else run_lowprio "${DECOMP[@]}" "$DATA"; fi; } |
-awk -F'\t' -v now="$NOW" -v gb="$GB" -v old="$OLD_DAYS" \
+awk -F'\t' -v now="$AGG_NOW" -v gb="$GB" -v old="$OLD_DAYS" \
     -v root="$ROOT" -v agg="$AGG_DEPTH" -v maxk="$MAX_DIR_KEYS" \
     -v statf="$STATF" -v dirmap="$DIRMAP" -v extmap="$EXTMAP" \
     -v total="$TOTAL_SCANNED" -v step="$PROGRESS_EVERY" -v fast="$FAST" \
@@ -457,8 +497,14 @@ END{
     # rollup bottom-up: una sola volta per directory foglia (non per file),
     # ricostruisce le dimensioni/conteggi RICORSIVI per ogni directory antenata
     # (fino a capn livelli sotto ROOT). Output identico al vecchio walk per-file.
+    if (step>0) {
+        printf "  rollup: consolidamento di %d directory foglia (AGG_DEPTH=%d)...\n", lk+0, agg > "/dev/stderr"
+        if (lk+0 > 2000000)
+            printf "  (molte directory: se questa fase risulta troppo lenta, rilancia con AGG_DEPTH piu basso, es. 6-8)\n" > "/dev/stderr"
+    }
     for (L in leaf_s) {
         ndirs++
+        if (ndirs % 100000 == 0) printf "  rollup... %d/%d dir\r", ndirs, lk+0 > "/dev/stderr"
         sv=leaf_s[L]; nv=leaf_n[L]
         if (rootlabel in ds) { ds[rootlabel]+=sv; dn[rootlabel]+=nv }
         else { ds[rootlabel]=sv; dn[rootlabel]=nv; nk++ }
@@ -475,6 +521,7 @@ END{
         }
         delete leaf_s[L]; delete leaf_n[L]
     }
+    if (step>0) printf "  rollup completato: %d directory                         \n", ndirs > "/dev/stderr"
 
     printf "%d %.0f %.0f %d %.0f %d %.0f %.0f %d %d %.0f\n", \
         f+0, t+0, r+0, c8+0, s8+0, capped+0, minm+0, maxm+0, maxdepth+0, ndirs+0, maxsize+0 > statf
