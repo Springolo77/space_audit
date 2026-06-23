@@ -114,7 +114,13 @@ if command -v pigz >/dev/null 2>&1; then
     DECOMP=(pigz -dc -p "$PARALLEL")
 fi
 
-SORT_OPTS=(-T "$WORK_TMP" --parallel="$PARALLEL" -S "$SORT_MEM" -t $'\t')
+# sort: -t e -k sono POSIX; -T, --parallel e -S sono estensioni GNU non presenti
+# su BusyBox/appliance embedded. Le includo solo se supportate (feature detection).
+_sort_supports(){ printf '' | sort "$@" >/dev/null 2>&1; }
+SORT_OPTS=(-t $'\t')
+_sort_supports -T "$WORK_TMP"  && SORT_OPTS+=(-T "$WORK_TMP")
+_sort_supports --parallel=1    && SORT_OPTS+=(--parallel="$PARALLEL")
+_sort_supports -S 1M           && SORT_OPTS+=(-S "$SORT_MEM")
 
 run_lowprio() {
     if command -v ionice >/dev/null 2>&1; then
@@ -136,12 +142,12 @@ fmt_int() { printf '%s' "$1" | rev | sed 's/[0-9]\{3\}/&./g' | rev | sed 's/^\./
 
 STATF=""; DIRMAP=""; EXTMAP=""; AGEF=""; FINDERR=""; SCANCNT=""
 T_TOPF=""; T_OLDER=""; T_CLEAN=""; T_DIRSZ=""; T_DIRCNT=""; T_EXT=""; T_OVER=""; OVER_RAW=""
-T_SZB=""; T_CAT=""; T_OWN=""
+T_SZB=""; T_CAT=""; T_OWN=""; T_DRAW=""
 
 cleanup() {
     for x in "$STATF" "$DIRMAP" "$EXTMAP" "$AGEF" "$FINDERR" "$SCANCNT" \
              "$T_TOPF" "$T_OLDER" "$T_CLEAN" "$T_DIRSZ" "$T_DIRCNT" "$T_EXT" "$T_OVER" "$OVER_RAW" \
-             "$T_SZB" "$T_CAT" "$T_OWN"; do
+             "$T_SZB" "$T_CAT" "$T_OWN" "$T_DRAW"; do
         if [[ -n "$x" ]]; then rm -f "$x"; fi
     done
     rm -f "${WORK_TMP}/.part.${TS}."* 2>/dev/null || true
@@ -164,6 +170,7 @@ OVER_RAW="$(mktemp "${WORK_TMP}/.ovraw.XXXXXX")"
 T_SZB="$(mktemp "${WORK_TMP}/.szb.XXXXXX")"
 T_CAT="$(mktemp "${WORK_TMP}/.cat.XXXXXX")"
 T_OWN="$(mktemp "${WORK_TMP}/.own.XXXXXX")"
+T_DRAW="$(mktemp "${WORK_TMP}/.draw.XXXXXX")"
 FINDERR="$(mktemp "${WORK_TMP}/.ferr.XXXXXX")"
 SCANCNT="$(mktemp "${WORK_TMP}/.cnt.XXXXXX")"
 
@@ -182,6 +189,16 @@ fi
 if [[ "$STREAM" = "1" && "$SCAN_JOBS" -gt 1 ]]; then
     log "NOTE: STREAM=1 -> scan forzato seriale (SCAN_JOBS ignorato)"
     SCAN_JOBS=1
+fi
+
+# Lo scan parallelo usa 'wait -n', disponibile solo da Bash 4.3. Su Bash piu vecchi
+# il fallback farebbe sfasare il contatore dei worker -> forziamo seriale.
+if [[ "$SCAN_JOBS" -gt 1 ]]; then
+    _bashv=$(( ${BASH_VERSINFO[0]:-0} * 100 + ${BASH_VERSINFO[1]:-0} ))
+    if (( _bashv < 403 )); then
+        log "NOTE: Bash ${BASH_VERSINFO[0]:-?}.${BASH_VERSINFO[1]:-?} < 4.3 (manca 'wait -n') -> scan forzato seriale"
+        SCAN_JOBS=1
+    fi
 fi
 
 # pre-check: spazio disponibile in WORK_TMP (temporanei, sort, dataset)
@@ -388,7 +405,7 @@ awk -F'\t' -v now="$AGG_NOW" -v gb="$GB" -v old="$OLD_DAYS" \
     -v total="$TOTAL_SCANNED" -v step="$PROGRESS_EVERY" -v fast="$FAST" \
     -v n="$TOPN" -v thr="$YEARS_VIEW_DAYS" -v skip="$CLEANUP_SKIP" \
     -v tf="$T_TOPF" -v ot="$T_OLDER" -v cl="$T_CLEAN" -v ovr="$OVER_RAW" \
-    -v szbf="$T_SZB" -v catf="$T_CAT" -v ownf="$T_OWN" '
+    -v szbf="$T_SZB" -v catf="$T_CAT" -v ownf="$T_OWN" -v draw="$T_DRAW" '
 BEGIN{
     if (root=="/") { rstart=2; rootlabel="/"; rbase="" }
     else { rc=split(root, ra, "/"); rstart=rc+1; rootlabel=root; rbase=root }
@@ -402,6 +419,7 @@ BEGIN{
     #    -> lo scarto, per non gonfiare i conteggi ne falsare le fasce di anzianita
     if (NF<5 || $1 !~ /^[0-9]+$/) { bad++; next }
     p=$5; for (i=6;i<=NF;i++) p=p "\t" $i
+    if (index(p,"\001")) { bad++; next }   # path con byte 001 (rarissimo): lo scarto per evitare collisioni nel rollup
     f++; t+=$1
     own_s[$2]+=$1; own_n[$2]++          # accumulo per proprietario (UID numerico, campo 2)
     if (step>0 && f%step==0) {
@@ -425,16 +443,15 @@ BEGIN{
     if (fn ~ /\.[^.]+$/ && fn !~ /^\./) { e=fn; sub(/^.*\./,"",e); ext=tolower(e) }
     es[ext]+=$1; ec[ext]++
 
-    # directory foglia (parent del file) ricavata dal basename calcolato sopra:
-    # nessuna seconda regex, solo substr. Accumulo O(1); rollup ricorsivo in END.
+    # directory foglia (parent del file) dal basename calcolato sopra: nessuna
+    # seconda regex, solo substr. Si emette un contributo per-file (size, leafdir)
+    # nel file draw; il rollup ricorsivo avviene poi via sort esterno (RAM costante,
+    # nessun cap). I separatori barra diventano byte 001 (piu basso di ogni
+    # carattere di path) per garantire nel sort la contiguita dei sottoalberi:
+    # una directory precede sempre i discendenti e nessun fratello si intromette.
     ld=substr(p,1,length(p)-length(fn)-1); if (ld=="") ld="/"
-    # cap sulla mappa foglia: MAX_DIR_KEYS limita la RAM ANCHE durante la passata,
-    # non solo il rollup in END. Oltre il cap i totali globali (byte, eta, ext,
-    # tipologia, dimensioni) restano esatti: si perde solo il dettaglio per-directory
-    # delle cartelle eccedenti (capped=1, warning a fine run).
-    if (ld in leaf_s) { leaf_s[ld]+=$1; leaf_n[ld]++ }
-    else if (maxk<=0 || lk<maxk) { leaf_s[ld]=$1; leaf_n[ld]=1; lk++ }
-    else capped=1
+    tld=ld; gsub(/\//,"\001",tld)
+    printf "%d\t%s\n", $1, tld > draw
 
     # categoria per tipologia (per spazio) - euristica su estensione
     cat="altri"
@@ -494,50 +511,26 @@ END{
     printf "5-10y     %10d %10.2f GB %.0f\n",c7,s7/gb,s7
     printf ">10y      %10d %10.2f GB %.0f\n",c8,s8/gb,s8
 
-    # rollup bottom-up: una sola volta per directory foglia (non per file),
-    # ricostruisce le dimensioni/conteggi RICORSIVI per ogni directory antenata
-    # (fino a capn livelli sotto ROOT). Output identico al vecchio walk per-file.
-    if (step>0) {
-        printf "  rollup: consolidamento di %d directory foglia (AGG_DEPTH=%d)...\n", lk+0, agg > "/dev/stderr"
-        if (lk+0 > 2000000)
-            printf "  (molte directory: se questa fase risulta troppo lenta, rilancia con AGG_DEPTH piu basso, es. 6-8)\n" > "/dev/stderr"
-    }
-    for (L in leaf_s) {
-        ndirs++
-        if (ndirs % 100000 == 0) printf "  rollup... %d/%d dir\r", ndirs, lk+0 > "/dev/stderr"
-        sv=leaf_s[L]; nv=leaf_n[L]
-        if (rootlabel in ds) { ds[rootlabel]+=sv; dn[rootlabel]+=nv }
-        else { ds[rootlabel]=sv; dn[rootlabel]=nv; nk++ }
-        if (L != rootlabel) {
-            nc=split(L, pp, "/")
-            lim=nc; if (lim>capn) lim=capn
-            dpath=rbase
-            for (i=rstart; i<=lim; i++) {
-                dpath=dpath "/" pp[i]
-                if (dpath in ds) { ds[dpath]+=sv; dn[dpath]+=nv }
-                else if (maxk<=0 || nk<maxk) { ds[dpath]=sv; dn[dpath]=nv; nk++ }
-                else { capped=1; break }
-            }
-        }
-        delete leaf_s[L]; delete leaf_n[L]
-    }
-    if (step>0) printf "  rollup completato: %d directory                         \n", ndirs > "/dev/stderr"
-
-    printf "%d %.0f %.0f %d %.0f %d %.0f %.0f %d %d %.0f\n", \
-        f+0, t+0, r+0, c8+0, s8+0, capped+0, minm+0, maxm+0, maxdepth+0, ndirs+0, maxsize+0 > statf
+    # Il rollup ricorsivo per directory NON avviene qui (degradava su mawk oltre
+    # qualche milione di chiavi): i contributi per-file sono nel file draw e
+    # vengono consolidati a valle via sort esterno (RAM costante, nessun cap).
+    # In STATF i campi capped (6) e ndirs (10) sono ora 0 e vengono riempiti dal
+    # passo di rollup esterno.
+    printf "%d %.0f %.0f %d %.0f %d %.0f %.0f %d %d %.0f %d\n", \
+        f+0, t+0, r+0, c8+0, s8+0, 0, minm+0, maxm+0, maxdepth+0, 0, maxsize+0, bad+0 > statf
     printf "%d %d %d %d %d\n", z1+0,z2+0,z3+0,z4+0,z5+0 > szbf
     printf "dati\t%.0f\nmedia\t%.0f\ndocumenti\t%.0f\narchivi\t%.0f\ndatabase\t%.0f\naltri\t%.0f\n", \
         catb["dati"]+0,catb["media"]+0,catb["documenti"]+0,catb["archivi"]+0,catb["database"]+0,catb["altri"]+0 > catf
-    for (k in ds) printf "%d\t%d\t%s\n", ds[k], dn[k], k > dirmap
-    for (k in es) printf "%d\t%d\t%s\n", es[k], ec[k], k > extmap
-    for (k in own_s) printf "%s\t%d\t%d\n", k, own_s[k], own_n[k] > ownf
+    for (k in es) printf "%.0f\t%d\t%s\n", es[k], ec[k], k > extmap
+    for (k in own_s) printf "%s\t%.0f\t%d\n", k, own_s[k], own_n[k] > ownf
     for (i=1;i<=tfN;i++) print TFr[i] > tf
     for (i=1;i<=olN;i++) print OLr[i] > ot
     for (i=1;i<=clN;i++) print CLr[i] > cl
 }' > "$AGEF"
 
 read -r TOTAL_FILES TOTAL_BYTES RECOVERABLE_BYTES OLD10_CNT OLD10_BYTES DIRCAP \
-        MIN_MTIME MAX_MTIME MAX_DEPTH DIR_COUNT MAX_FSIZE < "$STATF"
+        MIN_MTIME MAX_MTIME MAX_DEPTH DIR_COUNT MAX_FSIZE SKIPPED_FILES < "$STATF"
+SKIPPED_FILES="${SKIPPED_FILES:-0}"
 
 # in streaming il find termina insieme all'aggregazione: ora si possono valutare
 # gli errori (+ eventuale STRICT_SCAN) e l'eventuale risultato vuoto
@@ -551,7 +544,64 @@ if [[ "$STREAM" = "1" ]]; then
 fi
 
 log "Aggregation complete: files=$TOTAL_FILES size_bytes=$TOTAL_BYTES reclaimable_bytes=$RECOVERABLE_BYTES"
-[[ "${DIRCAP:-0}" = "1" ]] && { WARN=1; log "WARNING: mappa directory limitata a MAX_DIR_KEYS=$MAX_DIR_KEYS chiavi; TOP DIRECTORIES puo' essere incompleto (aumenta MAX_DIR_KEYS o abbassa AGG_DEPTH)"; }
+
+###############################################################################
+# ROLLUP DIRECTORY VIA SORT ESTERNO
+# I contributi per-file (size, leafdir) sono in T_DRAW, con i separatori "/"
+# gia' convertiti in \001. Un sort esterno (RAM costante, su disco) li ordina;
+# un singolo passo awk a "stack" risale l'albero e somma i totali RICORSIVI per
+# ogni directory da ROOT fino a capn=rc+AGG_DEPTH livelli. Sostituisce il vecchio
+# rollup in-hash che degradava (e richiedeva un cap) oltre qualche milione di
+# directory. Nessun cap: la TOP DIRECTORIES e' completa.
+# Semantica identica al rollup precedente: directory a profondita rc..capn.
+###############################################################################
+if [[ "$ROOT" = "/" ]]; then
+    _RSTART=2; _ROOTLABEL="/"; _RBASE=""
+else
+    _RC0="$(awk -F/ '{print NF; exit}' <<<"$ROOT")"
+    _RSTART=$(( _RC0 + 1 )); _ROOTLABEL="$ROOT"; _RBASE="$ROOT"
+fi
+_RC=$(( _RSTART - 1 )); _CAPN=$(( _RSTART - 1 + AGG_DEPTH ))
+
+log "Rollup directory (sort esterno, AGG_DEPTH=$AGG_DEPTH)"
+: > "$DIRMAP"
+if [[ -s "$T_DRAW" ]]; then
+    run_lowprio sort "${SORT_OPTS[@]}" -k2 "$T_DRAW" \
+      | run_lowprio awk -F'\t' -v rstart="$_RSTART" -v capn="$_CAPN" -v rc="$_RC" \
+            -v rbase="$_RBASE" -v rootlabel="$_ROOTLABEL" -v step="$PROGRESS_EVERY" '
+        function flush(L,   path) {
+            if (L>1) { sz[L-1]+=sz[L]; cnt[L-1]+=cnt[L] }
+            if (L>=rc && L<=capn) {
+                path = (L==rc) ? rootlabel : ppath[L]
+                printf "%.0f\t%d\t%s\n", sz[L], cnt[L], path
+                ne++
+                if (step>0 && ne%500000==0) printf "  rollup... %d directory\r", ne > "/dev/stderr"
+            }
+        }
+        {
+            s=$1+0
+            D=substr($0, index($0,"\t")+1)
+            nc=split(D, c, "\001")
+            while (nc>1 && c[nc]=="") nc--
+            m=0; while (m<top && m<nc && comp[m+1]==c[m+1]) m++
+            while (top>m) { flush(top); top-- }
+            while (top<nc) {
+                top++; comp[top]=c[top]; sz[top]=0; cnt[top]=0
+                if (top>=rstart)   ppath[top]=ppath[top-1] "/" c[top]
+                else if (top==rc)  ppath[top]=rbase
+                else               ppath[top]=""
+            }
+            sz[nc]+=s; cnt[nc]++
+        }
+        END {
+            while (top>0) { flush(top); top-- }
+            if (step>0) printf "  rollup completato: %d directory                         \n", ne+0 > "/dev/stderr"
+        }
+      ' > "$DIRMAP"
+fi
+DIR_COUNT="$(wc -l < "$DIRMAP" 2>/dev/null | tr -d ' ' || echo 0)"
+DIRCAP=0
+log "Rollup complete: directories=$DIR_COUNT"
 
 ATIME_MODE="$(findmnt -no OPTIONS --target "$ROOT" 2>/dev/null |
     grep -oE 'noatime|relatime|strictatime' | head -1 || true)"
@@ -695,6 +745,13 @@ echo "# Agg depth : $AGG_DEPTH levels below ROOT"
 echo "# NOTE      : CLEANUP / RECLAIMABLE are mtime heuristics - review before"
 echo "#             acting. Backup software (Veeam/Commvault/...) may keep mtime"
 echo "#             old on live files. Exclude active DB/backup/cache. Tool only reads."
+
+echo
+echo "OVERVIEW"
+echo "  Files (aggregated) : $(fmt_int "$TOTAL_FILES")"
+echo "  Total size         : $(human "$TOTAL_BYTES")"
+echo "  Directories w/files: $(fmt_int "$DIR_COUNT")"
+[[ "${SKIPPED_FILES:-0}" -gt 0 ]] && echo "  Skipped (malformed): $(fmt_int "$SKIPPED_FILES")  (newline/TAB/ctrl nel nome; byte non conteggiabili)"
 
 echo
 echo "FILESYSTEM"
@@ -1473,6 +1530,7 @@ _jesc(){ printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
   printf '  "timestamp": "%s",\n'               "$TS"
   printf '  "mode": "%s",\n'                     "$_mode"
   printf '  "files": %s,\n'                      "${TOTAL_FILES:-0}"
+  printf '  "skipped_malformed": %s,\n'          "${SKIPPED_FILES:-0}"
   printf '  "bytes": %s,\n'                      "${TOTAL_BYTES:-0}"
   printf '  "bytes_human": "%s",\n'              "$(human "${TOTAL_BYTES:-0}")"
   printf '  "directories_with_files": %s,\n'     "${DIR_COUNT:-0}"
