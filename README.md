@@ -152,6 +152,8 @@ nohup ./space_audit.sh /dati > audit.out 2>&1 &
 | `GZIP_LEVEL` | `6` (`1` se `FAST=1`) | Livello di compressione del dataset (`1` = CPU minima ma file più grande; `6` = bilanciato). Utile solo se la **compressione** è il collo di bottiglia (raro: di norma lo è `find`). |
 | `FAST` | `0` | `1` = modalità veloce: **salta** Top Files, Older, Cleanup e l'export > 10 anni (riduce la CPU per-file: niente `ln()`, niente top-N) e abbassa `GZIP_LEVEL` a `1`. Restano KPI, distribuzione per età/tipologia/dimensione, Top directory, trend, estensioni. |
 | `STREAM` | `0` | `1` = scansione+aggregazione in **streaming** (`find → awk` diretto): **non** produce il dataset `.tsv.gz` intermedio. Meno I/O e CPU (un giro gzip in meno), ma si perde l'artefatto dataset e l'avanzamento in `%` (solo conteggio). Forza la scansione seriale (`SCAN_JOBS` ignorato). |
+| `FROM_DATASET` | *(vuoto)* | Path a un `.tsv.gz` **esistente**: **riaggrega senza riscansionare**. Salta del tutto il `find` (minuti invece di ore), rigenera report/HTML/CSV/JSON con un nuovo timestamp. Il dataset di input **non** viene modificato né rimosso. Vedi [Rigenerazione da dataset](#rigenerazione-da-dataset). |
+| `AS_OF` | *(vuoto)* | Solo con `FROM_DATASET`: riferimento temporale per il calcolo dell'età (epoch o data leggibile da `date -d`). Default: il timestamp `YYYYMMDD_HHMMSS` estratto dal nome del dataset; fallback all'ora corrente. |
 | `STRICT_SCAN` | `0` | `1` = **fallisce** (exit ≠ 0) se gli errori di `find` superano `FIND_ERR_MAX` o se lo spazio in `WORK_TMP` è sotto `MIN_FREE_MB`. Default: solo `WARNING` e prosecuzione. |
 | `FIND_ERR_MAX` | `10000` | Soglia di errori `find` (accessi negati ecc.) tollerati: rilevante solo con `STRICT_SCAN=1`. |
 | `MIN_FREE_MB` | `512` | Spazio minimo (MB) richiesto in `WORK_TMP`: sotto soglia → `WARNING` (o abort se `STRICT_SCAN=1`). |
@@ -503,6 +505,44 @@ quello scenario la strada corretta è un'aggregazione *streaming* (scrivere
 ordinamento sull'intero insieme — il contrario dell'attuale passaggio unico
 senza sort. Per i volumi previsti qui non serve; è documentato come limite noto.
 
+### Rigenerazione da dataset
+
+Lo `.tsv.gz` prodotto da una scansione è la base di tutte le analisi: si può
+**riaggregare senza riscansionare**, riusando il dataset esistente. Su uno share
+da milioni di file questo trasforma ore di `find` in **minuti** di sola
+rielaborazione, e permette di cambiare i parametri di analisi a costo quasi nullo.
+
+```bash
+# riaggrega un dataset esistente con profondità di rollup ridotta
+FROM_DATASET=/var/tmp/space_audit/output/host_root_20260622_114930.tsv.gz \
+  AGG_DEPTH=6 WORK_TMP=/var/tmp ./space_audit.sh /mnt/Antiriciclaggio_WS
+```
+
+- Salta del tutto il `find`: nessuna scansione, nessun nuovo `.tsv.gz`.
+- Rigenera report/HTML/CSV/JSON con un **nuovo timestamp** (gli output originali
+  restano).
+- Il dataset di input **non** viene toccato né rimosso.
+- `ROOT` deve essere **lo stesso** della scansione originale (serve a calcolare
+  etichette e profondità delle directory; i percorsi nel dataset sono assoluti).
+- **Età**: poiché il dataset può essere vecchio, l'età si calcola rispetto al
+  momento della scansione (timestamp nel nome del file), non a "adesso";
+  sovrascrivibile con `AS_OF`.
+
+### Profondità di rollup (`AGG_DEPTH`) sui grandi alberi
+
+Il rollup finale (somma bottom-up per directory) ha un costo proporzionale al
+numero di directory foglia **per** i livelli di antenati aggregati, fino a
+`AGG_DEPTH` livelli sotto la radice. Su alberi **molto profondi e con milioni di
+directory**, il default `AGG_DEPTH=20` può rendere la fase finale di
+aggregazione estremamente lenta (CPU al 100% senza I/O, anche per ore).
+
+In quel caso **abbassa `AGG_DEPTH`** (es. `6`–`8`): il rollup diventa molto più
+leggero e la classifica "Top directory" resta significativa (le cartelle più
+profonde vengono aggregate al loro antenato a `AGG_DEPTH` livelli). **I totali
+globali, le fasce d'età, le tipologie e i Top file restano esatti** a qualunque
+`AGG_DEPTH`. Combinato con `FROM_DATASET`, puoi correggere il tiro su una
+scansione già fatta senza rieseguirla.
+
 ### Altre note
 
 - Metti `WORK_TMP` su **disco locale veloce** (es. `WORK_TMP=/var/tmp`): i
@@ -569,6 +609,13 @@ sul sistema. La fase mostrata e i dettagli relativi:
 - **AGGREGAZIONE** — PID, CPU e RSS dell'`awk` aggregatore, con l'**avanzamento %**
   ricavato dalla posizione di lettura del dataset (`/proc/<pid>/fdinfo`) rapportata
   alla dimensione del `.tsv.gz`.
+- **AGGREGAZIONE (rollup / finalizzazione)** — quando il dataset è stato **letto
+  per intero** (il decompressore è uscito) ma l'`awk` è ancora attivo: sta
+  eseguendo il consolidamento gerarchico finale (rollup). Il monitor lo distingue
+  esplicitamente e ricorda che, con CPU ~100% e nessun I/O di lettura, **non è un
+  blocco**: il completamento si vede in `[I/O]` quando `wchar` inizia a salire
+  (scrittura delle mappe directory). Lo stesso avanzamento è ora stampato anche
+  dallo script (`rollup: consolidamento di N directory foglia… / rollup completato`).
 - **SCAN+AGGREGAZIONE (streaming)** — in modalità `STREAM=1` le due fasi sono
   **fuse** (il `find` alimenta direttamente l'`awk`, senza dataset): il monitor lo
   rileva e segnala che l'avanzamento % non è disponibile (non c'è dataset da cui
