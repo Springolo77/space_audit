@@ -683,13 +683,40 @@ antiriciclaggio):
 ## Limiti noti
 
 - `mtime` come unica data (no `atime`/`ctime`/date applicative).
-- UID/GID numerici (nessuna risoluzione nomi).
+- UID/GID numerici (la risoluzione a nome avviene solo per i Top proprietari, via `getent`).
 - Estensione = ultima estensione in minuscolo (es. `archivio.tar.gz` → `gz`); i
   file senza estensione o "dotfile" vanno in `none`.
-- Mappa directory limitata da `MAX_DIR_KEYS` (guardia OOM): se scatta, le TOP
-  DIRECTORIES possono essere parziali (vedi warning nel log).
 - L'HTML mostra i primi `TOPN` per sezione; gli elenchi completi > 10 anni sono
   nel gz/CSV.
+- **`MAX_DIR_KEYS` è ora inerte**: il rollup delle directory usa un *sort esterno*
+  (RAM costante, su disco) senza più alcun tetto, quindi le TOP DIRECTORIES sono
+  sempre complete. La variabile resta per retrocompatibilità ma non ha effetto.
+- **Nomi file "sporchi"**: i file con *newline*, *TAB* o byte di controllo (`0x01`)
+  nel nome non sono rappresentabili in modo affidabile nel dataset TSV. Vengono
+  **contati e riportati** come `Skipped (malformed)` nel report e `skipped_malformed`
+  nel JSON; i loro *byte* non sono conteggiabili (il record è corrotto). Su 17,4M
+  file reali erano 8 — impatto trascurabile, ma esposto per trasparenza.
+- **Fotografia non atomica (intrinseco)**: la scansione di un filesystem *vivo* non
+  è istantanea. Se durante lo scan vengono creati/cancellati/modificati file (utenti,
+  backup, job notturni), il totale riflette uno stato "spalmato" sul tempo di
+  scansione, non un istante preciso. Non è correggibile in alcuno strumento di
+  questo tipo; per massima coerenza scansionare uno snapshot read-only (LVM/ZFS) o
+  in finestra di bassa attività.
+- **Date a granularità giornaliera e DST**: il CSV > 10 anni usa l'offset di fuso
+  corrente calcolato una volta; attorno al cambio ora solare/legale una data potrebbe
+  risultare spostata di un'ora, e quindi raramente di un giorno. Impatto pratico
+  trascurabile (soglie a 10 anni).
+
+### Portabilità
+
+- Pensato per **GNU coreutils** (Linux). Su `sort` vengono rilevate a runtime le
+  estensioni `--parallel`, `-S`, `-T` e usate solo se disponibili: su `sort`
+  **BusyBox**/appliance embedded lo strumento funziona comunque (senza parallelismo
+  e tuning della RAM di sort).
+- Lo **scan parallelo** (`SCAN_JOBS > 1`) richiede `wait -n` (**Bash ≥ 4.3**); su
+  versioni più vecchie viene forzato automaticamente lo scan seriale.
+- `awk`: compatibile con **mawk 1.3.x** e gawk (nessuna regex con classi di
+  caratteri contenenti `/`, nessun escape in bracket-class).
 
 ## Troubleshooting
 
