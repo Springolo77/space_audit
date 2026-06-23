@@ -606,16 +606,15 @@ sul sistema. La fase mostrata e i dettagli relativi:
   con la dimensione corrente (più il totale dei temporanei). Mostra anche quanto
   è cresciuto finora il dataset `.tsv.gz`. La **% non è disponibile** in questa
   fase: il totale dei file non è noto finché `find` non termina.
-- **AGGREGAZIONE** — PID, CPU e RSS dell'`awk` aggregatore, con l'**avanzamento %**
-  ricavato dalla posizione di lettura del dataset (`/proc/<pid>/fdinfo`) rapportata
-  alla dimensione del `.tsv.gz`.
-- **AGGREGAZIONE (rollup / finalizzazione)** — quando il dataset è stato **letto
-  per intero** (il decompressore è uscito) ma l'`awk` è ancora attivo: sta
-  eseguendo il consolidamento gerarchico finale (rollup). Il monitor lo distingue
-  esplicitamente e ricorda che, con CPU ~100% e nessun I/O di lettura, **non è un
-  blocco**: il completamento si vede in `[I/O]` quando `wchar` inizia a salire
-  (scrittura delle mappe directory). Lo stesso avanzamento è ora stampato anche
-  dallo script (`rollup: consolidamento di N directory foglia… / rollup completato`).
+- **AGGREGAZIONE (lettura dataset)** — l'`awk` aggregatore (firma `maxk=`) legge il
+  dataset e accumula i contributi per-file; con il decompressore visibile il monitor
+  mostra l'**avanzamento %** (posizione di lettura sul `.tsv.gz`).
+- **AGGREGAZIONE (rollup directory, sort esterno)** — fase successiva: i contributi
+  per-directory vengono ordinati con un `sort` esterno (firma `.draw`) e consolidati
+  da un `awk` a stack (firma `rstart=`). Il monitor mostra entrambi i processi con
+  CPU/RSS. È a **RAM costante** e senza cap; l'avanzamento (`rollup... N directory`)
+  è stampato dallo script su stderr. **Non è un blocco** anche se i contatori di
+  lettura I/O restano fermi: è lavoro CPU+disco.
 - **SCAN+AGGREGAZIONE (streaming)** — in modalità `STREAM=1` le due fasi sono
   **fuse** (il `find` alimenta direttamente l'`awk`, senza dataset): il monitor lo
   rileva e segnala che l'avanzamento % non è disponibile (non c'è dataset da cui
